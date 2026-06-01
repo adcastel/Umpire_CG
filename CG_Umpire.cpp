@@ -4,7 +4,7 @@
 #include <cmath>
 #include <iomanip>
 #include <stdexcept>
-
+#include <chrono>
 
 #include "umpire/Allocator.hpp"
 #include "umpire/ResourceManager.hpp"
@@ -12,6 +12,27 @@
 #include "umpire/util/error.hpp"
 #include "umpire/util/Macros.hpp"
 #include "umpire/util/numa.hpp"
+
+
+
+struct PCGProfile
+{
+    double preconditioner_time = 0.0; // z = precond * r
+    double dot1_time = 0.0;           // rho = r^T * z
+    double dot2_time = 0.0;           //conv = r^T * r
+    double step1_time = 0.0;          // tmp = rho / prev_rho; p = z + tmp * p
+    double spmv_time = 0.0;           // q = A * p
+    double dot3_time = 0.0;           // beta = p^T * q
+    double step2_time = 0.0;          // tmp = rho / beta; x = x + tmp * p; r = r - tmp * q
+
+    std::size_t preconditioner_calls = 0;
+    std::size_t dot1_calls = 0;
+    std::size_t dot2_calls = 0;
+    std::size_t step1_calls = 0;
+    std::size_t spmv_calls = 0;
+    std::size_t dot3_calls = 0;
+    std::size_t step2_calls = 0;
+};
 
 
 umpire::ResourceManager* rm{nullptr};
@@ -225,11 +246,17 @@ int pcg(
     const double * b,
     double * x,
     int max_iter,
-    double tol)
+    double tol, PCGProfile& profile)
 {
+
     const int n = A.n;
 
+
     JacobiPreconditioner M(A);
+
+   
+
+
 
     int node_r = std::atoi(std::getenv("R"));
     double * r = static_cast<double*>(allocate_memory(node_r, n * sizeof(double), "R"));
@@ -249,28 +276,58 @@ int pcg(
         r[i] = b[i] - Ap[i];
 
     // z = M^-1 r
-    M.apply(r, z, n);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    M.apply(r, z, n);    // PRECONDITIONER
+    auto t1 = std::chrono::high_resolution_clock::now();
+    profile.preconditioner_time +=
+    std::chrono::duration<double>(t1 - t0).count();
+    profile.preconditioner_calls++;
 
     //p = z;
     for (int i = 0; i < n; i++)
         p[i] = z[i];
 
-    double rz_old = dot(r, z, n);
+    auto t2 = std::chrono::high_resolution_clock::now();    
+    double rz_old = dot(r, z, n); // DOT1 rho = r^T * z
+    auto t3 = std::chrono::high_resolution_clock::now();
+    profile.dot1_time += std::chrono::duration<double>(t3 - t2).count();
+    profile.dot1_calls++;
+
 
     for (int iter = 0; iter < max_iter; iter++) {
 
+        // SPMV q = A*p
+        auto t4 = std::chrono::high_resolution_clock::now();
         A.matvec(p, Ap);
+        auto t5 = std::chrono::high_resolution_clock::now();
+        profile.spmv_time += std::chrono::duration<double>(t5 - t4).count();
+        profile.spmv_calls++;   
 
-        double alpha =
-            rz_old / dot(p, Ap, n);
+        auto t6 = std::chrono::high_resolution_clock::now();
+        double beta = dot(p, Ap, n); // DOT3 beta = p^T * q
+        auto t7 = std::chrono::high_resolution_clock::now();
+        profile.dot3_time += std::chrono::duration<double>(t7 - t6).count();
+        profile.dot3_calls++;
+
+        auto t8 = std::chrono::high_resolution_clock::now();
+        /// STEP 2 /////////////////////
+        double alpha = rz_old / beta; // tmp = rho / beta
+
+        for (int i = 0; i < n; i++) 
+            x[i] += alpha * p[i];   // AXPY x = x + tmp * p
 
         for (int i = 0; i < n; i++)
-            x[i] += alpha * p[i];
+            r[i] -= alpha * Ap[i];  // AXPY r = r - tmp * q
+        ///////////////////////////////
+        auto t9 = std::chrono::high_resolution_clock::now();
+        profile.step2_time += std::chrono::duration<double>(t9 - t8).count();
+        profile.step2_calls++;
 
-        for (int i = 0; i < n; i++)
-            r[i] -= alpha * Ap[i];
-
-        double residual = norm2(r,n);
+        auto t10 = std::chrono::high_resolution_clock::now();
+        double residual = norm2(r,n); // DOT 2 Convergencia = r^T * r
+        auto t11 = std::chrono::high_resolution_clock::now();
+        profile.dot2_time += std::chrono::duration<double>(t11 - t10).count();
+        profile.dot2_calls++;
 
         std::cout
             << "Iter "
@@ -284,15 +341,29 @@ int pcg(
         if (residual < tol)
             return iter + 1;
 
-        M.apply(r, z, n);
+        auto t12 = std::chrono::high_resolution_clock::now();
+        M.apply(r, z, n);  // PRECONDITIONER
+        auto t13 = std::chrono::high_resolution_clock::now();
+        profile.preconditioner_time += std::chrono::duration<double>(t13 - t12).count();
+        profile.preconditioner_calls++;
 
-        double rz_new = dot(r, z, n);
+        auto t14 = std::chrono::high_resolution_clock::now();
+        double rz_new = dot(r, z, n);  // DOT1
+        auto t15 = std::chrono::high_resolution_clock::now();
+        profile.dot1_time += std::chrono::duration<double>(t15 - t14).count();
+        profile.dot1_calls++;
 
-        double beta =
-            rz_new / rz_old;
+        auto t16 = std::chrono::high_resolution_clock::now();
+        // Step1 /////////////////////
+        double bet =
+            rz_new / rz_old; // step1 tmp = rho / prev_rho
 
-        for (int i = 0; i < n; i++)
-            p[i] = z[i] + beta * p[i];
+        for (int i = 0; i < n; i++) //step1 p = z + tmp +p
+            p[i] = z[i] + bet * p[i];
+        ///////////////////////////////
+        auto t17 = std::chrono::high_resolution_clock::now();
+        profile.step1_time += std::chrono::duration<double>(t17 - t16).count();
+        profile.step1_calls++;
 
         rz_old = rz_new;
     }
@@ -319,7 +390,7 @@ double compute_residual(
 int main(int argc, char *argv[])
 {
     try {
-        
+        std::cout << std::scientific << std::setprecision(3);
         //pool_type = select_pool();
         rm = &umpire::ResourceManager::getInstance();
         auto allocatable_nodes = umpire::numa::get_allocatable_nodes();
@@ -348,13 +419,15 @@ int main(int argc, char *argv[])
         for (int i = 0; i < A.n; i++) {
             x[i] = 0.0;
         }
+        PCGProfile profile;
 
         int iterations = pcg(
             A,
             b,
             x,
             1000,
-            1e-10);
+            1e-10,
+            profile);
 
         std::cout
             << "\nPCG converged in "
@@ -380,6 +453,17 @@ int main(int argc, char *argv[])
             << std::scientific
             << error
             << "\n";
+        
+
+        std::cout << "\nPerformance Profile:\n";
+        std::cout << "Method; Time (s); Calls; Avg Time per Call (s)\n";
+        std::cout << "Preconditioner Time: " << std::scientific << std::setprecision(3) << profile.preconditioner_time << ";" << profile.preconditioner_calls << ";" << (profile.preconditioner_calls > 0 ? profile.preconditioner_time / profile.preconditioner_calls : 0) << "\n";
+        std::cout << "Dot1 Time: " << std::scientific << profile.dot1_time << ";" << profile.dot1_calls << ";" << (profile.dot1_calls > 0 ? profile.dot1_time / profile.dot1_calls : 0) << "\n";
+        std::cout << "Dot2 Time: " << std::scientific << profile.dot2_time << ";" << profile.dot2_calls << ";" << (profile.dot2_calls > 0 ? profile.dot2_time / profile.dot2_calls : 0) << "\n";
+        std::cout << "Step1 Time: " << std::scientific << profile.step1_time << ";" << profile.step1_calls << ";" << (profile.step1_calls > 0 ? profile.step1_time / profile.step1_calls : 0) << "\n";
+        std::cout << "SPMV Time: " <<  std::scientific << profile.spmv_time << ";" << profile.spmv_calls << ";" << (profile.spmv_calls > 0 ? profile.spmv_time / profile.spmv_calls : 0) << "\n";
+        std::cout << "Dot3 Time: " << std::scientific << profile.dot3_time << ";" << profile.dot3_calls << ";" << (profile.dot3_calls > 0 ? profile.dot3_time / profile.dot3_calls : 0) << "\n";
+        std::cout << "Step2 Time: " << profile.step2_time << ";" << profile.step2_calls << ";" << (profile.step2_calls > 0 ? profile.step2_time / profile.step2_calls : 0) << "\n";
     }
     catch (const std::exception& e) {
 

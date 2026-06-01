@@ -1,4 +1,5 @@
 #make clean && make
+make
 
 #Node selection
 OBJ=CG_Umpire 
@@ -19,4 +20,4 @@ export AP=8
 #CHECK
 export AX=9
 
-./$OBJ
+./$OBJ /root/matrix/audikw_1/audikw_1.mtx 
